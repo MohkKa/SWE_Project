@@ -1,0 +1,592 @@
+
+```sql
+-- ============================================================
+-- SEQUENCES
+-- ============================================================
+CREATE SEQUENCE seq_users        START WITH 1 INCREMENT BY 1 NOCACHE NOCYCLE;
+CREATE SEQUENCE seq_wallets      START WITH 1 INCREMENT BY 1 NOCACHE NOCYCLE;
+CREATE SEQUENCE seq_transactions START WITH 1 INCREMENT BY 1 NOCACHE NOCYCLE;
+CREATE SEQUENCE seq_requests     START WITH 1 INCREMENT BY 1 NOCACHE NOCYCLE;
+
+-- ============================================================
+-- TABLES
+-- ============================================================
+CREATE TABLE Users (
+    UserID        NUMBER         NOT NULL,
+    UserName      VARCHAR2(100)  NOT NULL UNIQUE,
+    PasswordHash  VARCHAR2(256)  NOT NULL,
+    PIN           VARCHAR2(10)   NOT NULL,
+    PhoneNumber   VARCHAR2(20)   NOT NULL UNIQUE,
+    IsLocked      NUMBER(1)      DEFAULT 0 NOT NULL,
+    CreatedAt     TIMESTAMP      DEFAULT SYSTIMESTAMP NOT NULL,
+    CONSTRAINT pk_users     PRIMARY KEY (UserID),
+    CONSTRAINT chk_islocked CHECK (IsLocked IN (0, 1))
+);
+
+CREATE TABLE Wallets (
+    WalletID     NUMBER         NOT NULL,
+    UserID       NUMBER         NOT NULL,
+    Balance      NUMBER(15, 2)  DEFAULT 0.00 NOT NULL,
+    BankName     VARCHAR2(100)  NOT NULL,
+    CardNumber   VARCHAR2(20)   NOT NULL UNIQUE,
+    CreatedAt    TIMESTAMP      DEFAULT SYSTIMESTAMP NOT NULL,
+    CONSTRAINT pk_wallets     PRIMARY KEY (WalletID),
+    CONSTRAINT fk_wallet_user FOREIGN KEY (UserID) REFERENCES Users(UserID) ON DELETE CASCADE,
+    CONSTRAINT chk_balance    CHECK (Balance >= 0)
+);
+
+CREATE TABLE Transactions (
+    TransactionID    NUMBER         NOT NULL,
+    SenderWalletID   NUMBER         NOT NULL,
+    ReceiverWalletID NUMBER         NOT NULL,
+    Amount           NUMBER(15, 2)  NOT NULL,
+    TransactionType  VARCHAR2(50)   NOT NULL,
+    TransactionDate  TIMESTAMP      DEFAULT SYSTIMESTAMP NOT NULL,
+    Status           VARCHAR2(20)   DEFAULT 'Pending' NOT NULL,
+    CONSTRAINT pk_transactions PRIMARY KEY (TransactionID),
+    CONSTRAINT fk_txn_sender   FOREIGN KEY (SenderWalletID)   REFERENCES Wallets(WalletID),
+    CONSTRAINT fk_txn_receiver FOREIGN KEY (ReceiverWalletID) REFERENCES Wallets(WalletID),
+    CONSTRAINT chk_txn_amount  CHECK (Amount > 0),
+    CONSTRAINT chk_txn_status  CHECK (Status IN ('Pending','Completed','Failed','Reversed')),
+    CONSTRAINT chk_txn_type    CHECK (TransactionType IN ('Transfer','Deposit','Withdrawal','Request Payment'))
+);
+
+CREATE TABLE Requests (
+    RequestID      NUMBER         NOT NULL,
+    SenderUserID   NUMBER         NOT NULL,
+    ReceiverUserID NUMBER         NOT NULL,
+    Amount         NUMBER(15, 2)  NOT NULL,
+    RequestDate    TIMESTAMP      DEFAULT SYSTIMESTAMP NOT NULL,
+    Status         VARCHAR2(20)   DEFAULT 'Pending' NOT NULL,
+    Note           VARCHAR2(500),
+    CONSTRAINT pk_requests     PRIMARY KEY (RequestID),
+    CONSTRAINT fk_req_sender   FOREIGN KEY (SenderUserID)   REFERENCES Users(UserID),
+    CONSTRAINT fk_req_receiver FOREIGN KEY (ReceiverUserID) REFERENCES Users(UserID),
+    CONSTRAINT chk_req_amount  CHECK (Amount > 0),
+    CONSTRAINT chk_req_status  CHECK (Status IN ('Pending','Accepted','Rejected','Cancelled'))
+);
+
+
+CREATE OR REPLACE TRIGGER trg_users_id
+BEFORE INSERT ON Users FOR EACH ROW
+BEGIN
+    :NEW.UserID := seq_users.NEXTVAL;
+END;
+/
+
+CREATE OR REPLACE TRIGGER trg_wallets_id
+BEFORE INSERT ON Wallets FOR EACH ROW
+BEGIN
+    :NEW.WalletID := seq_wallets.NEXTVAL;
+END;
+/
+
+CREATE OR REPLACE TRIGGER trg_transactions_id
+BEFORE INSERT ON Transactions FOR EACH ROW
+BEGIN
+    :NEW.TransactionID := seq_transactions.NEXTVAL;
+END;
+/
+
+CREATE OR REPLACE TRIGGER trg_requests_id
+BEFORE INSERT ON Requests FOR EACH ROW
+BEGIN
+    :NEW.RequestID := seq_requests.NEXTVAL;
+END;
+/
+
+CREATE INDEX idx_wallet_userid ON Wallets(UserID);
+CREATE INDEX idx_txn_sender    ON Transactions(SenderWalletID);
+CREATE INDEX idx_txn_receiver  ON Transactions(ReceiverWalletID);
+CREATE INDEX idx_txn_date      ON Transactions(TransactionDate);
+CREATE INDEX idx_req_sender    ON Requests(SenderUserID);
+CREATE INDEX idx_req_receiver  ON Requests(ReceiverUserID);
+CREATE INDEX idx_req_status    ON Requests(Status);
+
+COMMIT;
+
+-- Increase the column size to accommodate the 64-character hash
+ALTER TABLE Users MODIFY (PasswordHash VARCHAR2(100));
+
+-- Also check your other fields like CardNumber if they are strictly defined
+ALTER TABLE Wallets MODIFY (CardNumber VARCHAR2(30));
+
+CREATE OR REPLACE PROCEDURE SP_GET_USER_BY_ID (
+    p_UserID       IN  Users.UserID%TYPE,
+    p_IsFound      OUT NUMBER,
+    p_ResultUserID OUT NUMBER,
+    p_IsLocked     OUT NUMBER
+)
+AS
+BEGIN
+    p_IsFound := 0;
+    SELECT UserID, IsLocked
+    INTO   p_ResultUserID, p_IsLocked
+    FROM   Users
+    WHERE  UserID = p_UserID;
+    p_IsFound := 1;
+EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+        p_IsFound      := 0;
+        p_ResultUserID := -1;
+        p_IsLocked     := -1;
+END SP_GET_USER_BY_ID;
+/
+
+CREATE OR REPLACE PROCEDURE SP_GET_WALLET_BY_USERID (
+    p_UserID    IN  Wallets.UserID%TYPE,
+    p_IsFound   OUT NUMBER,
+    p_WalletID  OUT NUMBER,
+    p_Balance   OUT NUMBER
+)
+AS
+BEGIN
+    p_IsFound := 0;
+    SELECT WalletID, Balance
+    INTO   p_WalletID, p_Balance
+    FROM   Wallets
+    WHERE  UserID = p_UserID;
+    p_IsFound := 1;
+EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+        p_IsFound  := 0;
+        p_WalletID := -1;
+        p_Balance  := -1;
+END SP_GET_WALLET_BY_USERID;
+/
+
+CREATE OR REPLACE PROCEDURE SP_VALIDATE_LOGIN (
+    p_UserName     IN  VARCHAR2,
+    p_PasswordHash IN  VARCHAR2,
+    p_IsValid      OUT NUMBER,
+    p_UserID       OUT NUMBER
+)
+AS
+    v_IsLocked NUMBER;
+BEGIN
+    p_IsValid := 0;
+    p_UserID  := -1;
+
+    SELECT UserID, IsLocked
+    INTO   p_UserID, v_IsLocked
+    FROM   Users
+    WHERE  UserName     = p_UserName
+      AND  PasswordHash = p_PasswordHash;
+
+    IF v_IsLocked = 1 THEN
+        p_IsValid := -1;
+    ELSE
+        p_IsValid := 1;
+    END IF;
+EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+        p_IsValid := 0;
+        p_UserID  := -1;
+END SP_VALIDATE_LOGIN;
+/
+
+CREATE OR REPLACE PROCEDURE SP_GET_ALL_TRANSACTIONS (
+    p_WalletID  IN  NUMBER,
+    p_Cursor    OUT SYS_REFCURSOR
+)
+AS
+BEGIN
+    OPEN p_Cursor FOR
+        SELECT t.TransactionID,
+               t.SenderWalletID,
+               t.ReceiverWalletID,
+               t.Amount,
+               t.TransactionType,
+               t.TransactionDate,
+               t.Status,
+               uw.UserName  AS SenderName,
+               ur.UserName  AS ReceiverName
+        FROM   Transactions t
+        JOIN   Wallets ws ON ws.WalletID = t.SenderWalletID
+        JOIN   Wallets wr ON wr.WalletID = t.ReceiverWalletID
+        JOIN   Users   uw ON uw.UserID   = ws.UserID
+        JOIN   Users   ur ON ur.UserID   = wr.UserID
+        WHERE  t.SenderWalletID   = p_WalletID
+           OR  t.ReceiverWalletID = p_WalletID
+        ORDER  BY t.TransactionDate DESC;
+END SP_GET_ALL_TRANSACTIONS;
+/
+
+CREATE OR REPLACE PROCEDURE SP_GET_PENDING_REQUESTS (
+    p_UserID IN  NUMBER,
+    p_Cursor OUT SYS_REFCURSOR
+)
+AS
+BEGIN
+    OPEN p_Cursor FOR
+        SELECT r.RequestID,
+               r.SenderUserID,
+               r.ReceiverUserID,
+               r.Amount,
+               r.RequestDate,
+               r.Status,
+               r.Note,
+               us.UserName AS SenderName,
+               ur.UserName AS ReceiverName
+        FROM   Requests r
+        JOIN   Users us ON us.UserID = r.SenderUserID
+        JOIN   Users ur ON ur.UserID = r.ReceiverUserID
+        WHERE  (r.ReceiverUserID = p_UserID OR r.SenderUserID = p_UserID)
+          AND  r.Status = 'Pending'
+        ORDER  BY r.RequestDate DESC;
+END SP_GET_PENDING_REQUESTS;
+/
+
+CREATE OR REPLACE PROCEDURE SP_GET_ALL_USERS (
+    p_Cursor OUT SYS_REFCURSOR
+)
+AS
+BEGIN
+    OPEN p_Cursor FOR
+        SELECT u.UserID,
+               u.UserName,
+               u.PhoneNumber,
+               u.IsLocked,
+               u.CreatedAt,
+               w.WalletID,
+               w.Balance,
+               w.BankName,
+               w.CardNumber
+        FROM   Users   u
+        LEFT JOIN Wallets w ON w.UserID = u.UserID
+        ORDER  BY u.UserID;
+END SP_GET_ALL_USERS;
+/
+
+CREATE OR REPLACE PROCEDURE SP_GET_TXN_BY_DATE (
+    p_StartDate       IN  DATE,
+    p_EndDate         IN  DATE,
+    p_TransactionType IN  VARCHAR2,
+    p_Cursor          OUT SYS_REFCURSOR
+)
+AS
+BEGIN
+    IF p_TransactionType = 'ALL' THEN
+        OPEN p_Cursor FOR
+            SELECT t.TransactionID,
+                   t.Amount,
+                   t.TransactionType,
+                   CAST(t.TransactionDate AS DATE) AS TransactionDate,
+                   t.Status,
+                   uw.UserName  AS SenderName,
+                   ur.UserName  AS ReceiverName,
+                   ws.BankName  AS SenderBank,
+                   wr.BankName  AS ReceiverBank
+            FROM   Transactions t
+            JOIN   Wallets ws ON ws.WalletID = t.SenderWalletID
+            JOIN   Wallets wr ON wr.WalletID = t.ReceiverWalletID
+            JOIN   Users   uw ON uw.UserID   = ws.UserID
+            JOIN   Users   ur ON ur.UserID   = wr.UserID
+            WHERE  CAST(t.TransactionDate AS DATE) BETWEEN p_StartDate AND p_EndDate
+            ORDER  BY t.TransactionDate DESC;
+    ELSE
+        OPEN p_Cursor FOR
+            SELECT t.TransactionID,
+                   t.Amount,
+                   t.TransactionType,
+                   CAST(t.TransactionDate AS DATE) AS TransactionDate,
+                   t.Status,
+                   uw.UserName  AS SenderName,
+                   ur.UserName  AS ReceiverName,
+                   ws.BankName  AS SenderBank,
+                   wr.BankName  AS ReceiverBank
+            FROM   Transactions t
+            JOIN   Wallets ws ON ws.WalletID = t.SenderWalletID
+            JOIN   Wallets wr ON wr.WalletID = t.ReceiverWalletID
+            JOIN   Users   uw ON uw.UserID   = ws.UserID
+            JOIN   Users   ur ON ur.UserID   = wr.UserID
+            WHERE  CAST(t.TransactionDate AS DATE) BETWEEN p_StartDate AND p_EndDate
+              AND  t.TransactionType = p_TransactionType
+            ORDER  BY t.TransactionDate DESC;
+    END IF;
+END SP_GET_TXN_BY_DATE;
+/
+
+CREATE OR REPLACE PROCEDURE SP_LOCK_USER (
+    p_UserID  IN  NUMBER,
+    p_Success OUT NUMBER
+)
+AS
+BEGIN
+    UPDATE Users SET IsLocked = 1 WHERE UserID = p_UserID;
+    IF SQL%ROWCOUNT > 0 THEN
+        COMMIT;
+        p_Success := 1;
+    ELSE
+        p_Success := 0;
+    END IF;
+EXCEPTION WHEN OTHERS THEN
+    ROLLBACK;
+    p_Success := -1;
+END SP_LOCK_USER;
+/
+
+CREATE OR REPLACE PROCEDURE SP_UNLOCK_USER (
+    p_UserID  IN  NUMBER,
+    p_Success OUT NUMBER
+)
+AS
+BEGIN
+    UPDATE Users SET IsLocked = 0 WHERE UserID = p_UserID;
+    IF SQL%ROWCOUNT > 0 THEN
+        COMMIT;
+        p_Success := 1;
+    ELSE
+        p_Success := 0;
+    END IF;
+EXCEPTION WHEN OTHERS THEN
+    ROLLBACK;
+    p_Success := -1;
+END SP_UNLOCK_USER;
+/
+
+CREATE OR REPLACE PROCEDURE SP_UPDATE_REQUEST_STATUS (
+    p_RequestID IN  NUMBER,
+    p_NewStatus IN  VARCHAR2,
+    p_Success   OUT NUMBER
+)
+AS
+BEGIN
+    UPDATE Requests
+    SET    Status = p_NewStatus
+    WHERE  RequestID = p_RequestID;
+
+    IF SQL%ROWCOUNT > 0 THEN
+        COMMIT;
+        p_Success := 1;
+    ELSE
+        p_Success := 0;
+    END IF;
+EXCEPTION WHEN OTHERS THEN
+    ROLLBACK;
+    p_Success := -1;
+END SP_UPDATE_REQUEST_STATUS;
+/
+
+CREATE OR REPLACE PROCEDURE SP_TRANSFER_FUNDS (
+    p_SenderWalletID   IN  NUMBER,
+    p_ReceiverWalletID IN  NUMBER,
+    p_Amount           IN  NUMBER,
+    p_Success          OUT NUMBER
+)
+AS
+    v_Balance NUMBER;
+BEGIN
+    SELECT Balance INTO v_Balance
+    FROM   Wallets
+    WHERE  WalletID = p_SenderWalletID
+    FOR UPDATE;
+
+    IF v_Balance < p_Amount THEN
+        p_Success := 0;
+        RETURN;
+    END IF;
+
+    UPDATE Wallets SET Balance = Balance - p_Amount
+    WHERE  WalletID = p_SenderWalletID;
+
+    UPDATE Wallets SET Balance = Balance + p_Amount
+    WHERE  WalletID = p_ReceiverWalletID;
+
+    INSERT INTO Transactions (SenderWalletID, ReceiverWalletID, Amount, TransactionType, Status)
+    VALUES (p_SenderWalletID, p_ReceiverWalletID, p_Amount, 'Transfer', 'Completed');
+
+    COMMIT;
+    p_Success := 1;
+
+EXCEPTION WHEN OTHERS THEN
+    ROLLBACK;
+    p_Success := -1;
+END SP_TRANSFER_FUNDS;
+/
+
+create or replace PROCEDURE SP_SEARCH_TRANSACTIONS
+(
+    p_WalletID IN NUMBER,
+    p_Search   IN VARCHAR2,
+    p_Cursor   OUT SYS_REFCURSOR
+)
+AS
+BEGIN
+    OPEN p_Cursor FOR
+        SELECT t.TransactionDate,
+               t.Amount,
+               t.TransactionType,
+               t.Status,
+               t.SenderWalletID,
+
+               us.USERNAME AS SenderName,
+               ur.USERNAME AS ReceiverName
+
+        FROM TRANSACTIONS t
+
+        
+        JOIN WALLETS ws ON t.SenderWalletID = ws.WalletID
+        JOIN USERS us ON ws.UserID = us.UserID
+
+        
+        JOIN WALLETS wr ON t.ReceiverWalletID = wr.WalletID
+        JOIN USERS ur ON wr.UserID = ur.UserID
+
+        WHERE (t.SenderWalletID = p_WalletID 
+            OR t.ReceiverWalletID = p_WalletID)
+
+        AND (LOWER(us.USERNAME) LIKE LOWER('%' || p_Search || '%')
+             OR LOWER(ur.USERNAME) LIKE LOWER('%' || p_Search || '%'))
+
+        ORDER BY t.TransactionDate DESC;
+END;
+/
+
+create or replace PROCEDURE SP_CREATE_REQUEST (
+    p_SenderUserID   IN NUMBER,
+    p_ReceiverPhone  IN VARCHAR2,
+    p_Amount         IN NUMBER,
+    p_Note           IN VARCHAR2,
+    p_Success        OUT NUMBER
+)
+AS
+    v_ReceiverUserID NUMBER;
+BEGIN
+    -- 1. Get ReceiverUserID from phone
+    SELECT UserID
+    INTO v_ReceiverUserID
+    FROM Users
+    WHERE PhoneNumber = p_ReceiverPhone;
+
+    -- 2. Insert request
+    INSERT INTO Requests (
+        SenderUserID,
+        ReceiverUserID,
+        Amount,
+        Status,
+        Note
+    )
+    VALUES (
+        p_SenderUserID,
+        v_ReceiverUserID,
+        p_Amount,
+        'Pending',
+        p_Note
+    );
+
+    COMMIT;
+    p_Success := 1;
+
+EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+        p_Success := 0; -- user not found
+
+    WHEN OTHERS THEN
+        ROLLBACK;
+        p_Success := -1;
+END;
+/
+
+
+create or replace PROCEDURE SP_REPORT_BANK (
+    p_user_id IN NUMBER,
+    p_bank    IN VARCHAR2,
+    p_cursor  OUT SYS_REFCURSOR
+)
+AS
+BEGIN
+    OPEN p_cursor FOR
+        SELECT 
+            t.TransactionID,
+            t.Amount,
+            t.TransactionType,
+            t.TransactionDate,
+            w.BankName
+        FROM Transactions t
+        JOIN Wallets w ON 
+            (w.WalletID = t.SenderWalletID OR w.WalletID = t.ReceiverWalletID)
+        WHERE w.UserID = p_user_id
+        AND UPPER(w.BankName) = UPPER(p_bank)
+        ORDER BY t.TransactionDate DESC;
+END;
+
+/
+
+
+
+create or replace PROCEDURE SP_REPORT_DATE (
+    p_user_id   IN NUMBER,
+    p_from_date IN DATE,
+    p_to_date   IN DATE,
+    p_cursor    OUT SYS_REFCURSOR
+)
+AS
+BEGIN
+    OPEN p_cursor FOR
+        SELECT 
+            t.TransactionID,
+            t.Amount,
+            t.TransactionType,
+            t.TransactionDate
+        FROM Transactions t
+        JOIN Wallets w
+        ON (w.WalletID = t.SenderWalletID OR w.WalletID = t.ReceiverWalletID)
+        WHERE w.UserID = p_user_id
+       AND TRUNC(t.TransactionDate)
+    BETWEEN TRUNC(p_from_date) AND TRUNC(p_to_date)
+        ORDER BY t.TransactionDate;
+END;
+/
+
+
+COMMIT;
+
+INSERT INTO Users (UserName, PasswordHash, PIN, PhoneNumber, IsLocked)
+VALUES ('ahmed.hassan',
+        '008C70392E3ABFBD0FA47BBC2ED96AA99BD49E159727FCBA0F2E6ABEB3A9D601',
+        '1234', '01012345678', 0);
+
+INSERT INTO Users (UserName, PasswordHash, PIN, PhoneNumber, IsLocked)
+VALUES ('sara.ali',
+        '008C70392E3ABFBD0FA47BBC2ED96AA99BD49E159727FCBA0F2E6ABEB3A9D601',
+        '5678', '01087654321', 0);
+
+INSERT INTO Users (UserName, PasswordHash, PIN, PhoneNumber, IsLocked)
+VALUES ('omar.mahmoud',
+        '008C70392E3ABFBD0FA47BBC2ED96AA99BD49E159727FCBA0F2E6ABEB3A9D601',
+        '9012', '01112233445', 0);
+
+INSERT INTO Wallets (UserID, Balance, BankName, CardNumber)
+VALUES (1, 5000.00, 'CIB Bank',      '4111111111111111');
+
+INSERT INTO Wallets (UserID, Balance, BankName, CardNumber)
+VALUES (2, 3500.50, 'National Bank', '4222222222222222');
+
+INSERT INTO Wallets (UserID, Balance, BankName, CardNumber)
+VALUES (3, 1200.75, 'Banque Misr',   '4333333333333333');
+
+INSERT INTO Transactions (SenderWalletID, ReceiverWalletID, Amount, TransactionType, Status)
+VALUES (1, 2, 500.00, 'Transfer', 'Completed');
+
+INSERT INTO Transactions (SenderWalletID, ReceiverWalletID, Amount, TransactionType, Status)
+VALUES (2, 3, 200.50, 'Transfer', 'Completed');
+
+INSERT INTO Transactions (SenderWalletID, ReceiverWalletID, Amount, TransactionType, Status)
+VALUES (3, 1, 100.00, 'Transfer', 'Completed');
+
+INSERT INTO Transactions (SenderWalletID, ReceiverWalletID, Amount, TransactionType, Status)
+VALUES (1, 2, 750.00, 'Transfer', 'Failed');
+
+INSERT INTO Requests (SenderUserID, ReceiverUserID, Amount, Status, Note)
+VALUES (2, 1, 300.00, 'Pending', 'Payment for dinner last night');
+
+INSERT INTO Requests (SenderUserID, ReceiverUserID, Amount, Status, Note)
+VALUES (3, 2, 150.00, 'Accepted', 'Gym membership split');
+
+INSERT INTO Requests (SenderUserID, ReceiverUserID, Amount, Status, Note)
+VALUES (1, 3, 50.00, 'Rejected', 'Coffee money');
+
+COMMIT;
+
+```
